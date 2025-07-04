@@ -19,8 +19,7 @@ typedef struct
   int distance;
   int inaccuracy;
   bool *markers;
-}
-wtf_entry_t;
+} wtf_entry_t;
 
 wtf_entry_t
 wtf_entry_new(char *label, size_t lsz)
@@ -68,7 +67,7 @@ int
 ldistance(char* a, size_t asz, char* b, size_t bsz)
 {
   int d[asz+1][bsz+1];
-  memset(d, 0, (asz+1 * sizeof(int)) * (bsz+1 * sizeof(int)));
+  memset(d, 0, (asz+1 + bsz+1) * sizeof(int));
 
   for (size_t i = 0; i < asz; i++) d[i][0] = i;
   for (size_t i = 0; i < bsz; i++) d[0][i] = i;
