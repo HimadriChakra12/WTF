@@ -1,4 +1,4 @@
-CC := cc
+CC := clang
 SOURCES := $(wildcard *.c)
 WARN := -Wall -Wextra -Wpedantic
 CFLAGS := -O3
