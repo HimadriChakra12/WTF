@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <wchar.h>
 #include <wctype.h>
+#include <locale.h>
 
 #include "config.h"
 #include "cvector.h"
@@ -12,24 +14,116 @@
 #define TB_IMPL
 #include "termbox2.h"
 
+#ifndef TAB_WIDTH
+#define TAB_WIDTH 8
+#endif
+
+/*
+ * A decoded Unicode codepoint from a UTF-8 byte sequence,
+ * along with how many bytes it consumed.
+ */
+typedef struct
+{
+  uint32_t cp;      /* Unicode codepoint */
+  size_t   byte_len; /* Number of bytes consumed from the source */
+} decoded_cp_t;
+
+/*
+ * Decode one UTF-8 codepoint from `s` of max length `len`.
+ * Returns the codepoint and how many bytes were consumed.
+ * On invalid sequences, returns U+FFFD (replacement char) consuming 1 byte.
+ */
+decoded_cp_t
+utf8_decode_one(const char *s, size_t len)
+{
+  decoded_cp_t result = { .cp = 0xFFFD, .byte_len = 1 };
+  if (!s || len == 0) return result;
+
+  unsigned char c = (unsigned char)s[0];
+
+  if (c < 0x80)
+  {
+    result.cp = c;
+    result.byte_len = 1;
+  }
+  else if ((c & 0xE0) == 0xC0 && len >= 2)
+  {
+    result.cp = (c & 0x1F) << 6
+              | ((unsigned char)s[1] & 0x3F);
+    result.byte_len = 2;
+  }
+  else if ((c & 0xF0) == 0xE0 && len >= 3)
+  {
+    result.cp = (c & 0x0F) << 12
+              | ((unsigned char)s[1] & 0x3F) << 6
+              | ((unsigned char)s[2] & 0x3F);
+    result.byte_len = 3;
+  }
+  else if ((c & 0xF8) == 0xF0 && len >= 4)
+  {
+    result.cp = (c & 0x07) << 18
+              | ((unsigned char)s[1] & 0x3F) << 12
+              | ((unsigned char)s[2] & 0x3F) << 6
+              | ((unsigned char)s[3] & 0x3F);
+    result.byte_len = 4;
+  }
+
+  return result;
+}
+
+/*
+ * Count the number of Unicode codepoints in a UTF-8 string.
+ */
+size_t
+utf8_cp_count(const char *s, size_t byte_len)
+{
+  size_t count = 0;
+  size_t i = 0;
+  while (i < byte_len)
+  {
+    decoded_cp_t d = utf8_decode_one(s + i, byte_len - i);
+    i += d.byte_len;
+    count++;
+  }
+  return count;
+}
+
+/*
+ * Get the display width of a Unicode codepoint.
+ * Uses wcwidth() for proper East Asian / emoji / Nerd Font support.
+ * Falls back to 1 for most characters, 0 for combining marks, 2 for wide chars.
+ */
+int
+cp_display_width(uint32_t cp)
+{
+  if (cp == '\t') return TAB_WIDTH;
+  if (cp < 32) return 0;
+
+  int w = tb_wcwidth((wchar_t)cp);
+  if (w < 0) return 1;
+  return w;
+}
+
 typedef struct
 {
   char *label;
-  size_t label_sz;
+  size_t label_sz;       /* byte length of label */
+  size_t label_cp_count; /* number of Unicode codepoints */
   int distance;
   int inaccuracy;
-  bool *markers;
+  bool *markers;         /* one bool per codepoint (not per byte) */
 } wtf_entry_t;
 
 wtf_entry_t
 wtf_entry_new(char *label, size_t lsz)
 {
-  bool *markers = malloc(lsz);
-  memset(markers, false, lsz);
+  size_t cp_count = utf8_cp_count(label, lsz);
+  bool *markers = calloc(cp_count, sizeof(bool));
 
   return (wtf_entry_t){
     .label = label,
     .label_sz = lsz,
+    .label_cp_count = cp_count,
     .distance = 0,
     .inaccuracy = 0,
     .markers = markers,
@@ -43,7 +137,7 @@ str_rate_free(wtf_entry_t *entry)
 }
 
 #define eq_case_insensitive(a, b) \
-  (towlower((a)) == towlower((b)))
+  (towlower((wint_t)(a)) == towlower((wint_t)(b)))
 
 int
 minimum(int x, int y)
@@ -58,71 +152,102 @@ minimum3(int x, int y, int z)
 }
 
 /*
- * Levenshtein distance.
- * Implemented from Wikipedia.org: https://en.wikipedia.org/wiki/Levenshtein_distance
- *
- * Tweaked array indexing though.
+ * Levenshtein distance operating on Unicode codepoints.
  */
 int
-ldistance(char* a, size_t asz, char* b, size_t bsz)
+ldistance_cp(uint32_t *a, size_t asz, uint32_t *b, size_t bsz)
 {
-  int d[asz+1][bsz+1];
-  memset(d, 0, (asz+1 + bsz+1) * sizeof(int));
+  /* Use heap allocation for large inputs */
+  int *d = calloc((asz + 1) * (bsz + 1), sizeof(int));
+  #define D(i, j) d[(i) * (bsz + 1) + (j)]
 
-  for (size_t i = 0; i < asz; i++) d[i][0] = i;
-  for (size_t i = 0; i < bsz; i++) d[0][i] = i;
+  for (size_t i = 0; i <= asz; i++) D(i, 0) = i;
+  for (size_t j = 0; j <= bsz; j++) D(0, j) = j;
 
-  for (size_t j = 0; j < bsz; j++)
+  for (size_t j = 1; j <= bsz; j++)
   {
-    for (size_t i = 0; i < asz; i++)
+    for (size_t i = 1; i <= asz; i++)
     {
-      int cost = (a[i] == b[j]) ? 0 : 1;
-
-      d[i+1][j+1] = minimum3(
-        d[i][j+1] + 1,
-        d[i+1][j] + 1,
-        d[i][j] + cost
+      int cost = (towlower(a[i-1]) == towlower(b[j-1])) ? 0 : 1;
+      D(i, j) = minimum3(
+        D(i-1, j) + 1,
+        D(i, j-1) + 1,
+        D(i-1, j-1) + cost
       );
     }
   }
 
-  return d[asz][bsz];
+  int result = D(asz, bsz);
+  free(d);
+  return result;
+
+  #undef D
 }
 
 /*
- * TODO: Document/explain this algorithm.
+ * Decode a UTF-8 string into an array of codepoints.
+ * Caller must free the returned array.
+ */
+uint32_t*
+utf8_to_cps(const char *s, size_t byte_len, size_t *out_count)
+{
+  size_t count = utf8_cp_count(s, byte_len);
+  uint32_t *cps = malloc(count * sizeof(uint32_t));
+
+  size_t bi = 0;
+  size_t ci = 0;
+  while (bi < byte_len && ci < count)
+  {
+    decoded_cp_t d = utf8_decode_one(s + bi, byte_len - bi);
+    cps[ci++] = d.cp;
+    bi += d.byte_len;
+  }
+
+  if (out_count) *out_count = count;
+  return cps;
+}
+
+/*
+ * Rate an entry against a pattern (both as UTF-8 strings).
+ * Markers are per-codepoint.
  */
 void
 wtf_entry_rate(wtf_entry_t *entry, char *pat, size_t pat_sz)
 {
-  char *l = entry->label;
-  size_t lsz = entry->label_sz;
+  size_t lcp_count = 0;
+  size_t pcp_count = 0;
+  uint32_t *label_cps = utf8_to_cps(entry->label, entry->label_sz, &lcp_count);
+  uint32_t *pat_cps   = utf8_to_cps(pat, pat_sz, &pcp_count);
+
   bool *marks = entry->markers;
 
   ssize_t most_distant_marker = -1;
 
   /* Clear old match markers. */
-  memset(marks, false, lsz);
+  memset(marks, false, lcp_count * sizeof(bool));
 
-  entry->inaccuracy = pat_sz;
+  entry->inaccuracy = pcp_count;
 
-  size_t j = 0; /* Index in pattern. */
-  for (size_t i = 0; i < lsz && j < pat_sz; i++)
+  size_t j = 0; /* Index in pattern codepoints. */
+  for (size_t i = 0; i < lcp_count && j < pcp_count; i++)
   {
-    if (eq_case_insensitive(l[i], pat[j]))
+    if (eq_case_insensitive(label_cps[i], pat_cps[j]))
     {
       if (most_distant_marker < 0) most_distant_marker = i;
-      marks[i] = true; /* Mark matched character. */
+      marks[i] = true;
       entry->inaccuracy--;
       j++;
     }
   }
 
-  entry->inaccuracy += (pat_sz - j);
-  entry->distance = ldistance(
-    l, lsz,
-    pat, pat_sz
-  ) + most_distant_marker + entry->inaccuracy;
+  entry->inaccuracy += (pcp_count - j);
+  entry->distance = ldistance_cp(
+    label_cps, lcp_count,
+    pat_cps, pcp_count
+  ) + (most_distant_marker >= 0 ? most_distant_marker : 0) + entry->inaccuracy;
+
+  free(label_cps);
+  free(pat_cps);
 }
 
 int
@@ -162,6 +287,52 @@ scroll_to_fit(size_t *scroll, size_t selected, size_t max_visible)
     cvector_set_size((dst), src_sz);     \
   } while (0)
 
+/*
+ * Draw a single entry label at (x, y) with proper UTF-8 / tab / wide char support.
+ * `markers` has one bool per codepoint indicating highlighted match.
+ */
+void
+draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr)
+{
+  const char *s = item->label;
+  size_t byte_len = item->label_sz;
+  bool *marks = item->markers;
+
+  size_t bi = 0;   /* byte index */
+  size_t ci = 0;   /* codepoint index */
+  int col = x;     /* current column on screen */
+
+  while (bi < byte_len)
+  {
+    decoded_cp_t d = utf8_decode_one(s + bi, byte_len - bi);
+    uint32_t cp = d.cp;
+
+    size_t fg_attr = primary_fg_attr;
+    if (marks && ci < item->label_cp_count && marks[ci])
+      fg_attr |= TB_RED | TB_BOLD;
+
+    if (cp == '\t')
+    {
+      /* Expand tab to spaces up to next tab stop */
+      int tab_stop = TAB_WIDTH - ((col - x) % TAB_WIDTH);
+      for (int t = 0; t < tab_stop; t++)
+      {
+        tb_set_cell(col, y, ' ', fg_attr, TB_DEFAULT);
+        col++;
+      }
+    }
+    else
+    {
+      int w = cp_display_width(cp);
+      tb_set_cell(col, y, cp, fg_attr, TB_DEFAULT);
+      col += w;
+    }
+
+    bi += d.byte_len;
+    ci++;
+  }
+}
+
 wtf_entry_t*
 finder_start(cvector(wtf_entry_t) *list)
 {
@@ -174,7 +345,9 @@ finder_start(cvector(wtf_entry_t) *list)
     }
   }
 
+  /* Enable UTF-8 output mode if termbox2 supports it */
   tb_set_input_mode(TB_INPUT_ESC | TB_INPUT_MOUSE);
+  tb_set_output_mode(TB_OUTPUT_NORMAL);
   tb_set_cursor(0, calcy(0));
 
   struct tb_event ev;
@@ -185,34 +358,41 @@ finder_start(cvector(wtf_entry_t) *list)
   wtf_entry_t **filtered = NULL;
 
   char *query = NULL;
-  size_t cursor = 0;
+  size_t cursor = 0;        /* cursor in codepoints */
+  size_t cursor_bytes = 0;  /* cursor position in bytes (for insertion) */
 
   size_t max_visible = tb_height() - 2;
   size_t selected = 0;
   size_t scroll = 0;
 
-  /*
-   * We set the destructor to NULL, and we copy references to items in `list`.
-   */
   cvector_init(filtered, 255, NULL);
   copy_item_refs(*list, filtered);
 
   cvector_init(query, 32, NULL);
 
+  /* Helper: recalculate cursor_bytes from cursor (codepoint position) */
+  #define recalc_cursor_bytes() do { \
+    cursor_bytes = 0; \
+    size_t _ci = 0; \
+    while (_ci < cursor && cursor_bytes < cvector_size(query)) { \
+      decoded_cp_t _d = utf8_decode_one(query + cursor_bytes, cvector_size(query) - cursor_bytes); \
+      cursor_bytes += _d.byte_len; \
+      _ci++; \
+    } \
+  } while(0)
+
+  /* Helper: get codepoint count of query */
+  #define query_cp_count() utf8_cp_count(query, cvector_size(query))
+
   do
   {
     if (cvector_size(filtered) == 0)
     {
-      /* Go to the beginning if we get no matches and then we get matches again instead of going at the end of the list. */
       selected = 0;
       scroll = 0;
     }
     else
     {
-      /*
-       * Reset scroll and select the last visible item if `filtered` shrank below the selector.
-       * Then, just adjust scroll again to fix selector going out of sight.
-       */
       if (selected >= cvector_size(filtered))
       {
         selected = cvector_size(filtered) - 1;
@@ -226,18 +406,45 @@ finder_start(cvector(wtf_entry_t) *list)
      */
     tb_clear();
     {
-      /* Print query and set the cursor at the end of it. */
+      /* Print query prefix */
       tb_print(0, calcy(0), QUERY_PREFIX_COLOR, TB_DEFAULT, QUERY_PREFIX);
-      tb_printf(QUERY_PREFIX_SZ + 1, calcy(0), TB_DEFAULT, TB_DEFAULT, "%.*s", cvector_size(query), query);
-      tb_set_cursor(QUERY_PREFIX_SZ + 1 + cursor, calcy(0));
 
-      /*
-       * Draw the status bar:
-       * - L/A -------------------------------------------
-       * Where:
-       *   L -> number of listed entries
-       *   A -> number of all entries
-       */
+      /* Print query with proper UTF-8 rendering */
+      {
+        int qx = QUERY_PREFIX_SZ + 1;
+        size_t bi = 0;
+        size_t ci = 0;
+        size_t cursor_screen_x = qx;
+
+        while (bi < cvector_size(query))
+        {
+          decoded_cp_t d = utf8_decode_one(query + bi, cvector_size(query) - bi);
+          if (ci == cursor) cursor_screen_x = qx;
+
+          if (d.cp == '\t')
+          {
+            int tab_stop = TAB_WIDTH - ((qx - (QUERY_PREFIX_SZ + 1)) % TAB_WIDTH);
+            for (int t = 0; t < tab_stop; t++)
+            {
+              tb_set_cell(qx, calcy(0), ' ', TB_DEFAULT, TB_DEFAULT);
+              qx++;
+            }
+          }
+          else
+          {
+            int w = cp_display_width(d.cp);
+            tb_set_cell(qx, calcy(0), d.cp, TB_DEFAULT, TB_DEFAULT);
+            qx += w;
+          }
+
+          bi += d.byte_len;
+          ci++;
+        }
+        if (ci == cursor) cursor_screen_x = qx;
+        tb_set_cursor(cursor_screen_x, calcy(0));
+      }
+
+      /* Status bar */
       {
         size_t w = 0;
 
@@ -258,7 +465,7 @@ finder_start(cvector(wtf_entry_t) *list)
           tb_print(i, calcy(1), STATUS_BAR_COLOR, TB_DEFAULT, STATUS_BAR_FILL);
       }
 
-      /* Draw the filtered list. */
+      /* Draw the filtered list using the new draw_label function. */
       size_t visible = cvector_size(filtered);
       if (visible > max_visible) visible = max_visible;
 
@@ -274,12 +481,7 @@ finder_start(cvector(wtf_entry_t) *list)
           primary_fg_attr |= TB_BOLD;
         }
 
-        for (size_t j = 0; j < item->label_sz; j++)
-        {
-          size_t fg_attr = primary_fg_attr;
-          if (item->markers[j]) fg_attr |= TB_RED | TB_BOLD;
-          tb_set_cell(SELECTOR_SZ + 1 + j, calcy(2 + i), item->label[j], fg_attr, TB_DEFAULT);
-        }
+        draw_label(SELECTOR_SZ + 1, calcy(2 + i), item, primary_fg_attr);
       }
     }
     tb_present();
@@ -292,7 +494,7 @@ finder_start(cvector(wtf_entry_t) *list)
     if (ev.type == TB_EVENT_RESIZE)
     {
       max_visible = tb_height() - 2;
-      scroll = 0; /* Reset scroll after resizing. */
+      scroll = 0;
       scroll_to_fit(&scroll, selected, max_visible);
     }
 
@@ -304,48 +506,95 @@ finder_start(cvector(wtf_entry_t) *list)
       switch (ev.key)
       {
         case 0:
-          cvector_insert(query, cursor, ev.ch);
+        {
+          /*
+           * ev.ch is a Unicode codepoint from termbox2.
+           * Encode it back to UTF-8 and insert at cursor_bytes.
+           */
+          char utf8_buf[4];
+          size_t utf8_len = 0;
+          uint32_t cp = ev.ch;
+
+          if (cp < 0x80) {
+            utf8_buf[0] = cp;
+            utf8_len = 1;
+          } else if (cp < 0x800) {
+            utf8_buf[0] = 0xC0 | (cp >> 6);
+            utf8_buf[1] = 0x80 | (cp & 0x3F);
+            utf8_len = 2;
+          } else if (cp < 0x10000) {
+            utf8_buf[0] = 0xE0 | (cp >> 12);
+            utf8_buf[1] = 0x80 | ((cp >> 6) & 0x3F);
+            utf8_buf[2] = 0x80 | (cp & 0x3F);
+            utf8_len = 3;
+          } else {
+            utf8_buf[0] = 0xF0 | (cp >> 18);
+            utf8_buf[1] = 0x80 | ((cp >> 12) & 0x3F);
+            utf8_buf[2] = 0x80 | ((cp >> 6) & 0x3F);
+            utf8_buf[3] = 0x80 | (cp & 0x3F);
+            utf8_len = 4;
+          }
+
+          /* Insert each byte at cursor_bytes position */
+          for (size_t b = 0; b < utf8_len; b++)
+            cvector_insert(query, cursor_bytes + b, utf8_buf[b]);
+
           cursor++;
+          cursor_bytes += utf8_len;
           query_update = true;
           break;
+        }
 
         case TB_KEY_BACKSPACE:
         case TB_KEY_BACKSPACE2:
           if (cvector_size(query) > 0 && cursor > 0)
           {
+            /* Find the byte position of the previous codepoint */
             cursor--;
-            cvector_erase(query, cursor);
+            size_t old_cursor_bytes = cursor_bytes;
+            recalc_cursor_bytes();
+            size_t erase_bytes = old_cursor_bytes - cursor_bytes;
+
+            for (size_t b = 0; b < erase_bytes; b++)
+              cvector_erase(query, cursor_bytes);
+
             query_update = true;
           }
           break;
 
         case TB_KEY_ARROW_LEFT:
-          cursor -= (cursor ? 1 : 0);
+          if (cursor > 0) {
+            cursor--;
+            recalc_cursor_bytes();
+          }
           break;
 
         case TB_KEY_ARROW_RIGHT:
-          cursor += ((cursor < cvector_size(query)) ? 1 : 0);
+          if (cursor < query_cp_count()) {
+            cursor++;
+            recalc_cursor_bytes();
+          }
           break;
 
         case TB_KEY_CTRL_A:
           cursor = 0;
+          cursor_bytes = 0;
           break;
 
         case TB_KEY_CTRL_E:
-          cursor = cvector_size(query);
+          cursor = query_cp_count();
+          cursor_bytes = cvector_size(query);
           break;
 
         case TB_KEY_ARROW_UP:
           if (cvector_size(filtered))
           {
-
 #ifdef DIRECTION_TOP
             if (selected > 0) selected--;
             else selected = cvector_size(filtered) - 1;
-#else /* DIRECTION_TOP */
+#else
             selected = (selected + 1) % cvector_size(filtered);
-#endif /* DIRECTION_TOP */
-
+#endif
             scroll_to_fit(&scroll, selected, max_visible);
           }
           break;
@@ -353,14 +602,12 @@ finder_start(cvector(wtf_entry_t) *list)
         case TB_KEY_ARROW_DOWN:
           if (cvector_size(filtered))
           {
-
 #ifdef DIRECTION_TOP
             selected = (selected + 1) % cvector_size(filtered);
-#else /* DIRECTION_TOP */
+#else
             if (selected > 0) selected--;
             else selected = cvector_size(filtered) - 1;
-#endif /* DIRECTION_TOP */
-
+#endif
             scroll_to_fit(&scroll, selected, max_visible);
           }
           break;
@@ -372,19 +619,15 @@ finder_start(cvector(wtf_entry_t) *list)
 
       if (query_update)
       {
-        /*
-         * Recompute the query when it's not empy.
-         * If it is empty, clear markers and list all entries.
-         */
         size_t query_sz = cvector_size(query);
 
         if (query_sz > 0)
         {
-          /* We don't need to worry about destroying the strings. */
           cvector_set_size(filtered, 0);
           for (size_t i = 0; i < cvector_size(*list); i++) {
             wtf_entry_rate(&(*list)[i], query, query_sz);
-            if ((*list)[i].inaccuracy <= FUZZ_MAX_INACCURACY) cvector_push_back(filtered, &(*list)[i]);
+            if ((*list)[i].inaccuracy <= FUZZ_MAX_INACCURACY)
+              cvector_push_back(filtered, &(*list)[i]);
           }
 
           qsort(
@@ -396,15 +639,17 @@ finder_start(cvector(wtf_entry_t) *list)
         }
         else
         {
-          /* Clear match markers - since we aren't matching against anything. */
           for (size_t i = 0; i < cvector_size(*list); i++)
-            memset(filtered[i]->markers, false, filtered[i]->label_sz);
+            memset((*list)[i].markers, false, (*list)[i].label_cp_count * sizeof(bool));
           copy_item_refs(*list, filtered);
         }
       }
     }
   }
   while (true);
+
+  #undef recalc_cursor_bytes
+  #undef query_cp_count
 
 start_finder_cleanup:
     cvector_free(query);
@@ -418,7 +663,7 @@ start_finder_cleanup:
 size_t
 read_to_vec(cvector(char) *vec, size_t buf_size, FILE *stream)
 {
-  size_t read = 0;
+  size_t total_read = 0;
   size_t i = 0;
 
   do
@@ -426,11 +671,11 @@ read_to_vec(cvector(char) *vec, size_t buf_size, FILE *stream)
     if (i + buf_size > cvector_capacity(*vec))
       cvector_reserve(*vec, cvector_capacity(*vec) * 2);
 
-    read = fread((char*)(*vec + i), sizeof(char), buf_size, stream);
-    i += read;
+    total_read = fread((char*)(*vec + i), sizeof(char), buf_size, stream);
+    i += total_read;
     cvector_set_size(*vec, i);
   }
-  while (read);
+  while (total_read);
 
   return i;
 }
@@ -451,16 +696,12 @@ print_help(FILE *stream)
   fprintf(stream, HELP);
 }
 
-#define push_entry(list, buf, offset, size) \
-  do { \
-    char *entry = (char*)((buf) + (offset)); \
-    cvector_push_back((list), str_rate_init((char*)((buf) + (offset)), (size))); \
-    entry[(size)] = '\0'; \
-  } while (0)
-
 int
 main(int argc, char **argv)
 {
+  /* Set locale for proper wcwidth() support */
+  setlocale(LC_ALL, "");
+
   if (argc > 1)
   {
     if (strcmp(argv[1], "--help") == 0
@@ -514,8 +755,6 @@ main(int argc, char **argv)
           size = 0;
         }
         offset++;
-
-        // Null terminate just in case...
         *ch = '\0';
       }
       else size++;
