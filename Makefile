@@ -1,6 +1,6 @@
 CC := clang
 SOURCES := $(wildcard *.c)
-WARN := -Wall -Wextra -Wpedantic
+WARN := -Wall -Wextra -Wpedantic -Os -pipe -s
 CFLAGS := -O3
 
 build:
