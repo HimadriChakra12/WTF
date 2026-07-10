@@ -7,6 +7,9 @@
 #include <wchar.h>
 #include <wctype.h>
 #include <locale.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #include "config.h"
 #include "cvector.h"
@@ -660,6 +663,101 @@ start_finder_cleanup:
     return entry;
 }
 
+/*
+ * Read entries of `path` into `vec` as a newline-separated list,
+ * skipping dotfiles/`.`/`..` (mirroring plain `ls`) and appending
+ * a trailing '/' to entries that are themselves directories, so
+ * they can be told apart from regular files at a glance.
+ */
+void
+expanddir(cvector(char) *vec, const char *path)
+{
+  DIR *dir = opendir(path);
+  if (!dir) return;
+
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != NULL)
+  {
+    if (ent->d_name[0] == '.') continue; /* skip ., .., and dotfiles */
+
+    size_t len = strlen(ent->d_name);
+    bool is_dir = false;
+
+#ifdef DT_DIR
+    if (ent->d_type == DT_DIR)
+      is_dir = true;
+    else if (ent->d_type != DT_UNKNOWN)
+      is_dir = false;
+    else
+#endif
+    {
+      char full[PATH_MAX];
+      snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+
+      struct stat st;
+      if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+        is_dir = true;
+    }
+
+    for (size_t i = 0; i < len; i++)
+      cvector_push_back(*vec, ent->d_name[i]);
+
+    if (is_dir)
+      cvector_push_back(*vec, '/');
+
+    cvector_push_back(*vec, '\n');
+  }
+
+  closedir(dir);
+}
+
+/*
+ * Recursively walk `path`, appending every regular file found to `vec`
+ * as a newline-separated relative-path list (fzf-style recursive
+ * source, but done natively instead of shelling out to `find`).
+ *
+ * Mirrors expanddir()'s dotfile-skipping so hidden trees like .git
+ * aren't crawled. Uses lstat() so symlinks are never followed into,
+ * matching `find`'s default (non -L) behavior and avoiding symlink
+ * loops.
+ */
+void
+expanddir_recursive(cvector(char) *vec, const char *path)
+{
+  DIR *dir = opendir(path);
+  if (!dir) return;
+
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != NULL)
+  {
+    if (ent->d_name[0] == '.') continue; /* skip ., .., and dotfiles/dirs */
+
+    char full[PATH_MAX];
+    snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+
+    struct stat st;
+    if (lstat(full, &st) != 0) continue;
+
+    if (S_ISDIR(st.st_mode))
+    {
+      expanddir_recursive(vec, full);
+    }
+    else if (S_ISREG(st.st_mode))
+    {
+      const char *rel = full;
+      if (rel[0] == '.' && rel[1] == '/') rel += 2;
+
+      size_t len = strlen(rel);
+      for (size_t i = 0; i < len; i++)
+        cvector_push_back(*vec, rel[i]);
+
+      cvector_push_back(*vec, '\n');
+    }
+  }
+
+  closedir(dir);
+}
+
 size_t
 read_to_vec(cvector(char) *vec, size_t buf_size, FILE *stream)
 {
@@ -689,8 +787,14 @@ print_help(FILE *stream)
   "Simple interactive command line fuzzy finder.\n" \
   "Designed to take any kind of new-line separated list from STDIN.\n" \
   "\n" \
+  "If no input is piped in, wtf sources its own list automatically:\n" \
+  "  - by default, the current directory's entries (dirs get a trailing /)\n" \
+  "  - with -r, every file under the current directory, recursively\n" \
+  "    (dotfiles/dirs like .git are skipped, symlinks aren't followed)\n" \
+  "\n" \
   "Options:\n" \
   "  -h, --help     display this help and exit\n" \
+  "  -r             when no stdin is piped, source input recursively\n" \
   "\n"
 
   fprintf(stream, HELP);
@@ -702,25 +806,25 @@ main(int argc, char **argv)
   /* Set locale for proper wcwidth() support */
   setlocale(LC_ALL, "");
 
-  if (argc > 1)
+  bool recursive = false;
+
+  for (int i = 1; i < argc; i++)
   {
-    if (strcmp(argv[1], "--help") == 0
-        || strcmp(argv[1], "-h") == 0)
+    if (strcmp(argv[i], "--help") == 0
+        || strcmp(argv[i], "-h") == 0)
     {
       print_help(stdout);
       return 0;
+    }
+    else if (strcmp(argv[i], "-r") == 0)
+    {
+      recursive = true;
     }
     else
     {
       print_help(stderr);
       return 2;
     }
-  }
-
-  if (isatty(STDIN_FILENO))
-  {
-    fprintf(stderr, "wtf: expected piped input\n");
-    return 2;
   }
 
   int err = 0;
@@ -730,7 +834,23 @@ main(int argc, char **argv)
   cvector_init(buf, 512, NULL);
   cvector_init(list, 64, NULL);
 
-  read_to_vec(&buf, 255, stdin);
+  if (isatty(STDIN_FILENO))
+  {
+    /*
+     * No piped input: auto-source a list, just like running
+     * `ls | wtf`, but done natively so directories are marked
+     * with a trailing '/'. With -r, recursively walk the tree
+     * instead, fzf-style.
+     */
+    if (recursive)
+      expanddir_recursive(&buf, ".");
+    else
+      expanddir(&buf, ".");
+  }
+  else
+  {
+    read_to_vec(&buf, 255, stdin);
+  }
 
   /*
    * Split entries by newlines.
