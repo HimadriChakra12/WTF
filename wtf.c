@@ -9,7 +9,12 @@
 #include <locale.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
 
 #include "config.h"
 #include "cvector.h"
@@ -115,6 +120,7 @@ typedef struct
   int distance;
   int inaccuracy;
   bool *markers;         /* one bool per codepoint (not per byte) */
+  bool marked;           /* multi-select mark, only meaningful with -m */
 } wtf_entry_t;
 
 wtf_entry_t
@@ -130,6 +136,7 @@ wtf_entry_new(char *label, size_t lsz)
     .distance = 0,
     .inaccuracy = 0,
     .markers = markers,
+    .marked = false,
   };
 }
 
@@ -293,9 +300,11 @@ scroll_to_fit(size_t *scroll, size_t selected, size_t max_visible)
 /*
  * Draw a single entry label at (x, y) with proper UTF-8 / tab / wide char support.
  * `markers` has one bool per codepoint indicating highlighted match.
+ * Drawing stops once `max_x` is reached, so the preview pane (if any) is never
+ * overwritten by an overlong entry.
  */
 void
-draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr)
+draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr, int max_x)
 {
   const char *s = item->label;
   size_t byte_len = item->label_sz;
@@ -307,6 +316,8 @@ draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr)
 
   while (bi < byte_len)
   {
+    if (col >= max_x) break;
+
     decoded_cp_t d = utf8_decode_one(s + bi, byte_len - bi);
     uint32_t cp = d.cp;
 
@@ -318,7 +329,7 @@ draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr)
     {
       /* Expand tab to spaces up to next tab stop */
       int tab_stop = TAB_WIDTH - ((col - x) % TAB_WIDTH);
-      for (int t = 0; t < tab_stop; t++)
+      for (int t = 0; t < tab_stop && col < max_x; t++)
       {
         tb_set_cell(col, y, ' ', fg_attr, TB_DEFAULT);
         col++;
@@ -336,8 +347,373 @@ draw_label(int x, int y, wtf_entry_t *item, size_t primary_fg_attr)
   }
 }
 
+/* A single line into a preview buffer, as a (offset, length) span. */
+typedef struct
+{
+  size_t offset;
+  size_t len;
+} preview_line_t;
+
+/*
+ * What kind of thing the preview pane is currently showing. Only
+ * PREVIEW_KIND_FILE gets line numbers -- directory listings, binary
+ * placeholders, symlink targets, etc. have their own formatting.
+ */
+typedef enum
+{
+  PREVIEW_KIND_MISSING,
+  PREVIEW_KIND_SYMLINK,
+  PREVIEW_KIND_DIR,
+  PREVIEW_KIND_BINARY,
+  PREVIEW_KIND_OTHER,
+  PREVIEW_KIND_FILE,
+} preview_kind_t;
+
+/*
+ * Split `buf` into a list of (offset, len) line spans on '\n', for
+ * scrollable line-by-line rendering. Does not copy: spans point back
+ * into `buf`, which must outlive `idx`.
+ */
+void
+build_line_index(cvector(preview_line_t) *idx, const char *buf, size_t buflen)
+{
+  cvector_set_size(*idx, 0);
+
+  size_t start = 0;
+  for (size_t i = 0; i < buflen; i++)
+  {
+    if (buf[i] == '\n')
+    {
+      preview_line_t l = { .offset = start, .len = i - start };
+      cvector_push_back(*idx, l);
+      start = i + 1;
+    }
+  }
+
+  if (start < buflen)
+  {
+    preview_line_t l = { .offset = start, .len = buflen - start };
+    cvector_push_back(*idx, l);
+  }
+}
+
+/*
+ * Draw a plain (unhighlighted) line of raw bytes at (x, y), clipped to
+ * `max_x`. Used for preview content, as opposed to draw_label() which
+ * is specific to fuzzy-matched list entries.
+ */
+void
+draw_text_line(int x, int y, const char *s, size_t byte_len, size_t fg_attr, int max_x)
+{
+  size_t bi = 0;
+  int col = x;
+
+  while (bi < byte_len)
+  {
+    if (col >= max_x) break;
+
+    decoded_cp_t d = utf8_decode_one(s + bi, byte_len - bi);
+
+    if (d.cp == '\t')
+    {
+      int tab_stop = TAB_WIDTH - ((col - x) % TAB_WIDTH);
+      for (int t = 0; t < tab_stop && col < max_x; t++)
+      {
+        tb_set_cell(col, y, ' ', fg_attr, TB_DEFAULT);
+        col++;
+      }
+    }
+    else
+    {
+      tb_set_cell(col, y, d.cp, fg_attr, TB_DEFAULT);
+      col += cp_display_width(d.cp);
+    }
+
+    bi += d.byte_len;
+  }
+}
+
+/* Classic `ls -l`-style 10-char permission string, e.g. "drwxr-xr-x". */
+void
+format_mode_str(mode_t mode, char out[11])
+{
+  out[0] = S_ISDIR(mode)  ? 'd'
+         : S_ISLNK(mode)  ? 'l'
+         : S_ISCHR(mode)  ? 'c'
+         : S_ISBLK(mode)  ? 'b'
+         : S_ISFIFO(mode) ? 'p'
+         : S_ISSOCK(mode) ? 's'
+         : '-';
+
+  out[1] = (mode & S_IRUSR) ? 'r' : '-';
+  out[2] = (mode & S_IWUSR) ? 'w' : '-';
+  out[3] = (mode & S_IXUSR) ? ((mode & S_ISUID) ? 's' : 'x') : ((mode & S_ISUID) ? 'S' : '-');
+  out[4] = (mode & S_IRGRP) ? 'r' : '-';
+  out[5] = (mode & S_IWGRP) ? 'w' : '-';
+  out[6] = (mode & S_IXGRP) ? ((mode & S_ISGID) ? 's' : 'x') : ((mode & S_ISGID) ? 'S' : '-');
+  out[7] = (mode & S_IROTH) ? 'r' : '-';
+  out[8] = (mode & S_IWOTH) ? 'w' : '-';
+  out[9] = (mode & S_IXOTH) ? ((mode & S_ISVTX) ? 't' : 'x') : ((mode & S_ISVTX) ? 'T' : '-');
+  out[10] = '\0';
+}
+
+typedef struct
+{
+  char name[NAME_MAX + 1];
+  struct stat st;
+} preview_dirent_t;
+
+int
+cmp_preview_dirent(const void *a, const void *b)
+{
+  return strcmp(((const preview_dirent_t*)a)->name, ((const preview_dirent_t*)b)->name);
+}
+
+/* Detailed, `ls -la`-style directory listing appended to `out`. */
+void
+build_dir_detail_preview(cvector(char) *out, const char *path)
+{
+  DIR *dir = opendir(path);
+  if (!dir)
+  {
+    const char *msg = "(cannot open directory)\n";
+    for (const char *p = msg; *p; p++) cvector_push_back(*out, *p);
+    return;
+  }
+
+  preview_dirent_t *entries = NULL;
+  cvector_init(entries, 64, NULL);
+
+  struct dirent *ent;
+  while ((ent = readdir(dir)) != NULL)
+  {
+    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+
+    char full[PATH_MAX];
+    snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+
+    preview_dirent_t pe;
+    strncpy(pe.name, ent->d_name, sizeof(pe.name) - 1);
+    pe.name[sizeof(pe.name) - 1] = '\0';
+
+    if (lstat(full, &pe.st) != 0) continue;
+
+    cvector_push_back(entries, pe);
+  }
+  closedir(dir);
+
+  qsort(entries, cvector_size(entries), sizeof(preview_dirent_t), cmp_preview_dirent);
+
+  size_t n = cvector_size(entries);
+  {
+    char hdr[64];
+    int hlen = snprintf(hdr, sizeof(hdr), "%zu item%s\n\n", n, n == 1 ? "" : "s");
+    for (int i = 0; i < hlen && i < (int)sizeof(hdr); i++)
+      cvector_push_back(*out, hdr[i]);
+  }
+
+  for (size_t i = 0; i < n; i++)
+  {
+    char perms[11];
+    format_mode_str(entries[i].st.st_mode, perms);
+
+    struct passwd *pw = getpwuid(entries[i].st.st_uid);
+    struct group *gr = getgrgid(entries[i].st.st_gid);
+
+    struct tm tmv;
+    localtime_r(&entries[i].st.st_mtime, &tmv);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%b %d %H:%M", &tmv);
+
+    char line[PATH_MAX + 128];
+    int len = snprintf(
+      line, sizeof(line),
+      "%s %2ld %-8.8s %-8.8s %8lld %s %s%s\n",
+      perms,
+      (long)entries[i].st.st_nlink,
+      pw ? pw->pw_name : "?",
+      gr ? gr->gr_name : "?",
+      (long long)entries[i].st.st_size,
+      timebuf,
+      entries[i].name,
+      S_ISDIR(entries[i].st.st_mode) ? "/" : ""
+    );
+
+    for (int j = 0; j < len && j < (int)sizeof(line); j++)
+      cvector_push_back(*out, line[j]);
+  }
+
+  cvector_free(entries);
+}
+
+/*
+ * `cat`-like file preview, capped at PREVIEW_MAX_BYTES. Sniffs the
+ * first PREVIEW_BINARY_SNIFF_BYTES for a NUL byte first (same
+ * heuristic git/grep use); if found, the file is treated as binary
+ * and its content is never dumped, just a placeholder + its size.
+ */
+preview_kind_t
+build_file_preview(cvector(char) *out, const char *path, off_t size_hint)
+{
+  FILE *f = fopen(path, "rb");
+  if (!f)
+  {
+    const char *msg = "(cannot open file)\n";
+    for (const char *p = msg; *p; p++) cvector_push_back(*out, *p);
+    return PREVIEW_KIND_OTHER;
+  }
+
+  unsigned char sniff[PREVIEW_BINARY_SNIFF_BYTES];
+  size_t sniff_n = fread(sniff, 1, sizeof(sniff), f);
+
+  bool binary = false;
+  for (size_t i = 0; i < sniff_n; i++)
+  {
+    if (sniff[i] == '\0') { binary = true; break; }
+  }
+
+  if (binary)
+  {
+    fclose(f);
+    char msg[64];
+    int len = snprintf(msg, sizeof(msg), "(binary file, %lld bytes)\n", (long long)size_hint);
+    for (int i = 0; i < len && i < (int)sizeof(msg); i++) cvector_push_back(*out, msg[i]);
+    return PREVIEW_KIND_BINARY;
+  }
+
+  rewind(f);
+
+  char chunk[4096];
+  size_t total = 0;
+  size_t n;
+  bool truncated = false;
+
+  while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0)
+  {
+    size_t take = n;
+    if (total + take > PREVIEW_MAX_BYTES)
+    {
+      take = PREVIEW_MAX_BYTES - total;
+      truncated = true;
+    }
+
+    for (size_t i = 0; i < take; i++)
+      cvector_push_back(*out, chunk[i]);
+
+    total += take;
+    if (truncated) break;
+  }
+
+  fclose(f);
+
+  if (truncated)
+  {
+    const char *msg = "\n... (truncated) ...\n";
+    for (const char *p = msg; *p; p++) cvector_push_back(*out, *p);
+  }
+
+  return PREVIEW_KIND_FILE;
+}
+
+/*
+ * Resolve a list entry's label into a full path we can preview,
+ * relative to `base_dir` (the directory wtf auto-sourced from, if
+ * any -- "." otherwise). A leading '/' in the label is treated as
+ * already-absolute. A trailing '/' directory marker is stripped.
+ */
+void
+resolve_preview_path(char *out, size_t out_sz, const char *base_dir, const char *label, size_t label_sz)
+{
+  size_t len = label_sz;
+  if (len > 0 && label[len - 1] == '/') len--;
+
+  if (len > 0 && label[0] == '/')
+  {
+    size_t n = (len < out_sz - 1) ? len : out_sz - 1;
+    memcpy(out, label, n);
+    out[n] = '\0';
+  }
+  else
+  {
+    snprintf(out, out_sz, "%s/%.*s", base_dir ? base_dir : ".", (int)len, label);
+  }
+}
+
+/*
+ * (Re)build the preview content + line index for `full_path`: a
+ * detailed listing for directories, file contents for regular files,
+ * the symlink target for symlinks, or a placeholder otherwise.
+ */
+/*
+ * (Re)build the preview content + line index for `full_path`: a
+ * detailed listing for directories, file contents for regular files,
+ * the symlink target for symlinks, or a placeholder otherwise.
+ * Returns what kind of thing was previewed.
+ */
+preview_kind_t
+build_preview(cvector(char) *out, cvector(preview_line_t) *idx, const char *full_path)
+{
+  cvector_set_size(*out, 0);
+  preview_kind_t kind;
+
+  struct stat st;
+  if (lstat(full_path, &st) != 0)
+  {
+    const char *msg = "(no preview available)\n";
+    for (const char *p = msg; *p; p++) cvector_push_back(*out, *p);
+    kind = PREVIEW_KIND_MISSING;
+  }
+  else if (S_ISLNK(st.st_mode))
+  {
+    char target[PATH_MAX];
+    ssize_t n = readlink(full_path, target, sizeof(target) - 1);
+    char line[PATH_MAX + 32];
+    int len;
+
+    if (n >= 0)
+    {
+      target[n] = '\0';
+      len = snprintf(line, sizeof(line), "symlink -> %s\n", target);
+    }
+    else
+    {
+      len = snprintf(line, sizeof(line), "(broken symlink)\n");
+    }
+
+    for (int i = 0; i < len && i < (int)sizeof(line); i++)
+      cvector_push_back(*out, line[i]);
+
+    kind = PREVIEW_KIND_SYMLINK;
+  }
+  else if (S_ISDIR(st.st_mode))
+  {
+    build_dir_detail_preview(out, full_path);
+    kind = PREVIEW_KIND_DIR;
+  }
+  else if (S_ISREG(st.st_mode))
+  {
+    kind = build_file_preview(out, full_path, st.st_size);
+  }
+  else
+  {
+    const char *msg = "(no preview for this file type)\n";
+    for (const char *p = msg; *p; p++) cvector_push_back(*out, *p);
+    kind = PREVIEW_KIND_OTHER;
+  }
+
+  build_line_index(idx, *out, cvector_size(*out));
+  return kind;
+}
+
 wtf_entry_t*
-finder_start(cvector(wtf_entry_t) *list)
+finder_start(
+  cvector(wtf_entry_t) *list,
+  const char *source_label,
+  const char *base_dir,
+  bool preview_requested,
+  bool multi_mode,
+  cvector(wtf_entry_t*) *out_selected
+)
 {
   {
     int tb_status = tb_init();
@@ -367,6 +743,18 @@ finder_start(cvector(wtf_entry_t) *list)
   size_t max_visible = tb_height() - 2;
   size_t selected = 0;
   size_t scroll = 0;
+
+  /* Preview pane state. */
+  char *preview_buf = NULL;
+  preview_line_t *preview_idx = NULL;
+  size_t preview_scroll = 0;
+  wtf_entry_t *previewed_entry = NULL;
+  preview_kind_t preview_kind = PREVIEW_KIND_MISSING;
+  char preview_path[PATH_MAX];
+  preview_path[0] = '\0';
+
+  cvector_init(preview_buf, 512, NULL);
+  cvector_init(preview_idx, 64, NULL);
 
   cvector_init(filtered, 255, NULL);
   copy_item_refs(*list, filtered);
@@ -409,25 +797,46 @@ finder_start(cvector(wtf_entry_t) *list)
      */
     tb_clear();
     {
+      bool show_preview = PREVIEW_ENABLED && preview_requested && (int)tb_width() >= PREVIEW_MIN_TERM_WIDTH;
+      int preview_w = show_preview ? ((int)tb_width() * PREVIEW_WIDTH_PCT / 100) : 0;
+      int list_w = show_preview ? ((int)tb_width() - preview_w - 1) : (int)tb_width();
+
+      /* Print source label (e.g. "ls", a path, "argv", "stdin"), its own slot */
+      size_t label_w = 0;
+      if (source_label && source_label[0] != '\0')
+      {
+        tb_printf_ex(
+          0,
+          calcy(0),
+          SOURCE_LABEL_COLOR,
+          TB_DEFAULT,
+          &label_w,
+          "[%s] ",
+          source_label
+        );
+      }
+
       /* Print query prefix */
-      tb_print(0, calcy(0), QUERY_PREFIX_COLOR, TB_DEFAULT, QUERY_PREFIX);
+      tb_print(label_w, calcy(0), QUERY_PREFIX_COLOR, TB_DEFAULT, QUERY_PREFIX);
 
       /* Print query with proper UTF-8 rendering */
       {
-        int qx = QUERY_PREFIX_SZ + 1;
+        int qx = (int)label_w + QUERY_PREFIX_SZ + 1;
         size_t bi = 0;
         size_t ci = 0;
         size_t cursor_screen_x = qx;
 
         while (bi < cvector_size(query))
         {
+          if (qx >= list_w) break;
+
           decoded_cp_t d = utf8_decode_one(query + bi, cvector_size(query) - bi);
           if (ci == cursor) cursor_screen_x = qx;
 
           if (d.cp == '\t')
           {
-            int tab_stop = TAB_WIDTH - ((qx - (QUERY_PREFIX_SZ + 1)) % TAB_WIDTH);
-            for (int t = 0; t < tab_stop; t++)
+            int tab_stop = TAB_WIDTH - ((qx - ((int)label_w + QUERY_PREFIX_SZ + 1)) % TAB_WIDTH);
+            for (int t = 0; t < tab_stop && qx < list_w; t++)
             {
               tb_set_cell(qx, calcy(0), ' ', TB_DEFAULT, TB_DEFAULT);
               qx++;
@@ -463,7 +872,7 @@ finder_start(cvector(wtf_entry_t) *list)
           cvector_size(*list)
         );
 
-        const size_t remaining_dashes = tb_width();
+        const size_t remaining_dashes = (size_t)list_w;
         for (size_t i = (w + 1); i < remaining_dashes; i += STATUS_BAR_FILL_SZ)
           tb_print(i, calcy(1), STATUS_BAR_COLOR, TB_DEFAULT, STATUS_BAR_FILL);
       }
@@ -471,6 +880,9 @@ finder_start(cvector(wtf_entry_t) *list)
       /* Draw the filtered list using the new draw_label function. */
       size_t visible = cvector_size(filtered);
       if (visible > max_visible) visible = max_visible;
+
+      int label_x = SELECTOR_SZ + 1;
+      if (multi_mode) label_x += MARK_GLYPH_SZ + 1;
 
       for (size_t i = 0; i < visible; i++)
       {
@@ -484,7 +896,74 @@ finder_start(cvector(wtf_entry_t) *list)
           primary_fg_attr |= TB_BOLD;
         }
 
-        draw_label(SELECTOR_SZ + 1, calcy(2 + i), item, primary_fg_attr);
+        if (multi_mode && item->marked)
+          tb_print(SELECTOR_SZ + 1, calcy(2 + i), MARK_COLOR, TB_DEFAULT, MARK_GLYPH);
+
+        draw_label(label_x, calcy(2 + i), item, primary_fg_attr, list_w);
+      }
+
+      /* Preview pane, for the currently selected entry. */
+      if (show_preview)
+      {
+        wtf_entry_t *current = (cvector_size(filtered) > 0) ? filtered[selected] : NULL;
+
+        if (current != previewed_entry)
+        {
+          previewed_entry = current;
+          preview_scroll = 0;
+
+          if (current)
+          {
+            resolve_preview_path(preview_path, sizeof(preview_path), base_dir, current->label, current->label_sz);
+            preview_kind = build_preview(&preview_buf, &preview_idx, preview_path);
+          }
+          else
+          {
+            preview_path[0] = '\0';
+            preview_kind = PREVIEW_KIND_MISSING;
+            cvector_set_size(preview_buf, 0);
+            cvector_set_size(preview_idx, 0);
+          }
+        }
+
+        size_t total_lines = cvector_size(preview_idx);
+        size_t max_scroll = (total_lines > max_visible) ? (total_lines - max_visible) : 0;
+        if (preview_scroll > max_scroll) preview_scroll = max_scroll;
+
+        int px = list_w + 1;
+
+        for (int y = 0; y < (int)tb_height(); y++)
+          tb_set_cell(list_w, y, 0x2502, PREVIEW_BORDER_COLOR, TB_DEFAULT);
+
+        if (current)
+          draw_text_line(px, calcy(0), preview_path, strlen(preview_path), PREVIEW_HEADER_COLOR, (int)tb_width());
+
+        /* Only plain file content gets line numbers; listings/placeholders have their own format. */
+        int lineno_w = 0;
+        if (preview_kind == PREVIEW_KIND_FILE && total_lines > 0)
+        {
+          size_t n = total_lines;
+          while (n > 0) { lineno_w++; n /= 10; }
+        }
+
+        for (size_t i = 0; i < max_visible; i++)
+        {
+          size_t line_idx = preview_scroll + i;
+          if (line_idx >= total_lines) break;
+
+          preview_line_t pl = preview_idx[line_idx];
+          int content_x = px;
+
+          if (lineno_w > 0)
+          {
+            char numbuf[24];
+            int numlen = snprintf(numbuf, sizeof(numbuf), "%*zu ", lineno_w, line_idx + 1);
+            draw_text_line(px, calcy(2 + i), numbuf, (size_t)numlen, PREVIEW_LINENO_COLOR, (int)tb_width());
+            content_x = px + lineno_w + 1;
+          }
+
+          draw_text_line(content_x, calcy(2 + i), preview_buf + pl.offset, pl.len, TB_DEFAULT, (int)tb_width());
+        }
       }
     }
     tb_present();
@@ -501,7 +980,7 @@ finder_start(cvector(wtf_entry_t) *list)
       scroll_to_fit(&scroll, selected, max_visible);
     }
 
-    if (ev.key == TB_KEY_ESC) goto start_finder_cleanup;
+    if (ev.key == KEY_QUIT) goto start_finder_cleanup;
     if (ev.type == TB_EVENT_KEY)
     {
       bool query_update = false;
@@ -565,31 +1044,31 @@ finder_start(cvector(wtf_entry_t) *list)
           }
           break;
 
-        case TB_KEY_ARROW_LEFT:
+        case KEY_LEFT:
           if (cursor > 0) {
             cursor--;
             recalc_cursor_bytes();
           }
           break;
 
-        case TB_KEY_ARROW_RIGHT:
+        case KEY_RIGHT:
           if (cursor < query_cp_count()) {
             cursor++;
             recalc_cursor_bytes();
           }
           break;
 
-        case TB_KEY_CTRL_A:
+        case KEY_LINE_HOME:
           cursor = 0;
           cursor_bytes = 0;
           break;
 
-        case TB_KEY_CTRL_E:
+        case KEY_LINE_END:
           cursor = query_cp_count();
           cursor_bytes = cvector_size(query);
           break;
 
-        case TB_KEY_ARROW_UP:
+        case KEY_UP:
           if (cvector_size(filtered))
           {
 #ifdef DIRECTION_TOP
@@ -602,7 +1081,7 @@ finder_start(cvector(wtf_entry_t) *list)
           }
           break;
 
-        case TB_KEY_ARROW_DOWN:
+        case KEY_DOWN:
           if (cvector_size(filtered))
           {
 #ifdef DIRECTION_TOP
@@ -615,9 +1094,41 @@ finder_start(cvector(wtf_entry_t) *list)
           }
           break;
 
-        case TB_KEY_ENTER:
-          entry = (cvector_size(filtered) > 0) ? filtered[selected] : NULL;
+        case KEY_CONFIRM:
+          if (multi_mode)
+          {
+            cvector_set_size(*out_selected, 0);
+            for (size_t i = 0; i < cvector_size(*list); i++)
+              if ((*list)[i].marked)
+                cvector_push_back(*out_selected, &(*list)[i]);
+
+            /* Nothing marked: fall back to whatever's highlighted, like fzf does. */
+            if (cvector_size(*out_selected) == 0 && cvector_size(filtered) > 0)
+              cvector_push_back(*out_selected, filtered[selected]);
+          }
+          else
+          {
+            entry = (cvector_size(filtered) > 0) ? filtered[selected] : NULL;
+          }
           goto start_finder_cleanup;
+
+        case KEY_TOGGLE_MARK:
+          if (multi_mode && cvector_size(filtered) > 0)
+            filtered[selected]->marked = !filtered[selected]->marked;
+          break;
+
+        case KEY_PREVIEW_DOWN:
+        case KEY_PREVIEW_DOWN_ALT:
+          preview_scroll += PREVIEW_SCROLL_STEP;
+          break;
+
+        case KEY_PREVIEW_UP:
+        case KEY_PREVIEW_UP_ALT:
+          if (preview_scroll > (size_t)PREVIEW_SCROLL_STEP)
+            preview_scroll -= PREVIEW_SCROLL_STEP;
+          else
+            preview_scroll = 0;
+          break;
       }
 
       if (query_update)
@@ -657,6 +1168,8 @@ finder_start(cvector(wtf_entry_t) *list)
 start_finder_cleanup:
     cvector_free(query);
     cvector_free(filtered);
+    cvector_free(preview_buf);
+    cvector_free(preview_idx);
 
     tb_shutdown();
 
@@ -668,9 +1181,12 @@ start_finder_cleanup:
  * skipping dotfiles/`.`/`..` (mirroring plain `ls`) and appending
  * a trailing '/' to entries that are themselves directories, so
  * they can be told apart from regular files at a glance.
+ *
+ * If `dirs_only` is true, regular files are skipped entirely and
+ * only directories are listed.
  */
 void
-expanddir(cvector(char) *vec, const char *path)
+expanddir(cvector(char) *vec, const char *path, bool dirs_only)
 {
   DIR *dir = opendir(path);
   if (!dir) return;
@@ -699,6 +1215,8 @@ expanddir(cvector(char) *vec, const char *path)
         is_dir = true;
     }
 
+    if (dirs_only && !is_dir) continue;
+
     for (size_t i = 0; i < len; i++)
       cvector_push_back(*vec, ent->d_name[i]);
 
@@ -716,13 +1234,17 @@ expanddir(cvector(char) *vec, const char *path)
  * as a newline-separated relative-path list (fzf-style recursive
  * source, but done natively instead of shelling out to `find`).
  *
+ * If `dirs_only` is true, directories are listed (with a trailing
+ * '/') instead of regular files; the walk itself is unaffected, so
+ * every directory in the tree is still visited and descended into.
+ *
  * Mirrors expanddir()'s dotfile-skipping so hidden trees like .git
  * aren't crawled. Uses lstat() so symlinks are never followed into,
  * matching `find`'s default (non -L) behavior and avoiding symlink
  * loops.
  */
 void
-expanddir_recursive(cvector(char) *vec, const char *path)
+expanddir_recursive(cvector(char) *vec, const char *path, bool dirs_only)
 {
   DIR *dir = opendir(path);
   if (!dir) return;
@@ -740,9 +1262,22 @@ expanddir_recursive(cvector(char) *vec, const char *path)
 
     if (S_ISDIR(st.st_mode))
     {
-      expanddir_recursive(vec, full);
+      if (dirs_only)
+      {
+        const char *rel = full;
+        if (rel[0] == '.' && rel[1] == '/') rel += 2;
+
+        size_t len = strlen(rel);
+        for (size_t i = 0; i < len; i++)
+          cvector_push_back(*vec, rel[i]);
+
+        cvector_push_back(*vec, '/');
+        cvector_push_back(*vec, '\n');
+      }
+
+      expanddir_recursive(vec, full, dirs_only);
     }
-    else if (S_ISREG(st.st_mode))
+    else if (!dirs_only && S_ISREG(st.st_mode))
     {
       const char *rel = full;
       if (rel[0] == '.' && rel[1] == '/') rel += 2;
@@ -756,6 +1291,104 @@ expanddir_recursive(cvector(char) *vec, const char *path)
   }
 
   closedir(dir);
+}
+
+/*
+ * Best-effort detection of the process feeding our stdin pipe, so
+ * e.g. `ls | wtf` can show "ls" as its source label. Only meaningful
+ * when stdin is actually a pipe.
+ *
+ * This walks /proc, looking for a process with an fd pointing at
+ * the same pipe inode as our stdin, opened for writing, then reads
+ * its comm. This is inherently racy and Linux-only: a pipe carries
+ * no record of who's on the other end, so if the writer has already
+ * finished and exited (common for fast, small-output commands) by
+ * the time we look, its /proc entry -- and thus its name -- is gone.
+ * Returns a heap-allocated string the caller must free(), or NULL if
+ * nothing could be determined.
+ */
+char *
+detect_pipe_writer(void)
+{
+  struct stat pipe_st;
+  if (fstat(STDIN_FILENO, &pipe_st) != 0 || !S_ISFIFO(pipe_st.st_mode))
+    return NULL;
+
+  DIR *proc = opendir("/proc");
+  if (!proc) return NULL;
+
+  pid_t self = getpid();
+  char *result = NULL;
+  struct dirent *pent;
+
+  while (!result && (pent = readdir(proc)) != NULL)
+  {
+    char *end;
+    long pid = strtol(pent->d_name, &end, 10);
+    if (*end != '\0' || pid <= 0 || (pid_t)pid == self) continue;
+
+    char fd_dir[64];
+    snprintf(fd_dir, sizeof(fd_dir), "/proc/%ld/fd", pid);
+
+    DIR *fds = opendir(fd_dir);
+    if (!fds) continue;
+
+    struct dirent *fent;
+    while ((fent = readdir(fds)) != NULL)
+    {
+      if (fent->d_name[0] == '.') continue;
+
+      char fd_path[PATH_MAX];
+      snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir, fent->d_name);
+
+      struct stat st;
+      if (stat(fd_path, &st) != 0
+          || !S_ISFIFO(st.st_mode)
+          || st.st_ino != pipe_st.st_ino)
+        continue;
+
+      char fdinfo_path[PATH_MAX];
+      snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%ld/fdinfo/%s", pid, fent->d_name);
+
+      FILE *fi = fopen(fdinfo_path, "r");
+      if (!fi) continue;
+
+      int is_writer = 0;
+      char line[64];
+      while (fgets(line, sizeof(line), fi))
+      {
+        unsigned long flags;
+        if (sscanf(line, "flags: %lo", &flags) == 1)
+        {
+          if ((flags & O_ACCMODE) != O_RDONLY) is_writer = 1;
+          break;
+        }
+      }
+      fclose(fi);
+
+      if (!is_writer) continue;
+
+      char comm_path[64];
+      snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+
+      FILE *cf = fopen(comm_path, "r");
+      if (!cf) break;
+
+      char comm[256];
+      if (fgets(comm, sizeof(comm), cf))
+      {
+        comm[strcspn(comm, "\n")] = '\0';
+        if (comm[0] != '\0') result = strdup(comm);
+      }
+      fclose(cf);
+      break;
+    }
+
+    closedir(fds);
+  }
+
+  closedir(proc);
+  return result;
 }
 
 size_t
@@ -782,19 +1415,50 @@ void
 print_help(FILE *stream)
 {
 #define HELP \
-  "Usage: wtf [OPTIONS]\n" \
+  "Usage: wtf [OPTIONS] [PATH]\n" \
   "\n" \
   "Simple interactive command line fuzzy finder.\n" \
   "Designed to take any kind of new-line separated list from STDIN.\n" \
   "\n" \
+  "A source label is shown in its own slot left of the query bar,\n" \
+  "e.g. \"[ls]\" for piped input (best-effort), \"[.]\"/\"[PATH]\" when\n" \
+  "auto-sourcing a directory, or \"[argv]\" when args are used directly.\n" \
+  "Use -l to set it explicitly. This matters for shell builtins like\n" \
+  "cd: `cd $(wtf)` can never show \"[cd]\" on its own, since cd never\n" \
+  "becomes a process wtf could detect, and it hasn't even run yet at\n" \
+  "the point wtf is reading input -- wrap it instead, e.g.:\n" \
+  "  cdw() { cd \"$(wtf -l cd -d \"$@\")\"; }\n" \
+  "\n" \
   "If no input is piped in, wtf sources its own list automatically:\n" \
-  "  - by default, the current directory's entries (dirs get a trailing /)\n" \
-  "  - with -r, every file under the current directory, recursively\n" \
+  "  - by default, PATH's entries (dirs get a trailing /), or the\n" \
+  "    current directory's if PATH isn't given\n" \
+  "  - with -r, every file under PATH, recursively\n" \
   "    (dotfiles/dirs like .git are skipped, symlinks aren't followed)\n" \
+  "  - with -d, only directories are listed (combine with -r to walk\n" \
+  "    the whole tree looking for them)\n" \
+  "  - given multiple positional args (e.g. `wtf $(ls)`), or a single\n" \
+  "    arg that isn't a directory, they're used directly as entries\n" \
+  "\n" \
+  "A preview pane on the right shows the selected entry: file contents\n" \
+  "(cat-style, with line numbers; binary files are detected and shown\n" \
+  "as a placeholder instead of dumped) for files, a detailed\n" \
+  "`ls -la`-style listing for directories, or the target for symlinks.\n" \
+  "Off by default -- pass -p to turn it on. Ctrl-D/PgDn and Ctrl-U/PgUp\n" \
+  "scroll it. Hidden automatically in narrow terminals. Entries\n" \
+  "are resolved relative to PATH (or \".\" if none was given / entries\n" \
+  "came from stdin or argv), unless the entry itself is an absolute path.\n" \
+  "\n" \
+  "With -m, multiple entries can be selected: Tab marks/unmarks the\n" \
+  "highlighted entry, Enter prints every marked entry (one per line),\n" \
+  "or just the highlighted one if nothing was marked.\n" \
   "\n" \
   "Options:\n" \
   "  -h, --help     display this help and exit\n" \
   "  -r             when no stdin is piped, source input recursively\n" \
+  "  -d             when no stdin is piped, list directories only\n" \
+  "  -p             show the preview pane\n" \
+  "  -m             multi-select mode (Tab to mark, Enter to confirm all)\n" \
+  "  -l LABEL       set the source label explicitly\n" \
   "\n"
 
   fprintf(stream, HELP);
@@ -807,6 +1471,13 @@ main(int argc, char **argv)
   setlocale(LC_ALL, "");
 
   bool recursive = false;
+  bool dirs_only = false;
+  bool preview_requested = false;
+  bool multi_mode = false;
+  const char *label_override = NULL;
+
+  const char **positional = malloc(sizeof(char*) * (size_t)(argc > 0 ? argc : 1));
+  int npositional = 0;
 
   for (int i = 1; i < argc; i++)
   {
@@ -814,22 +1485,74 @@ main(int argc, char **argv)
         || strcmp(argv[i], "-h") == 0)
     {
       print_help(stdout);
+      free(positional);
       return 0;
     }
     else if (strcmp(argv[i], "-r") == 0)
     {
       recursive = true;
     }
-    else
+    else if (strcmp(argv[i], "-d") == 0)
+    {
+      dirs_only = true;
+    }
+    else if (strcmp(argv[i], "-p") == 0)
+    {
+      preview_requested = true;
+    }
+    else if (strcmp(argv[i], "-m") == 0)
+    {
+      multi_mode = true;
+    }
+    else if (strcmp(argv[i], "-l") == 0)
+    {
+      if (i + 1 >= argc)
+      {
+        print_help(stderr);
+        free(positional);
+        return 2;
+      }
+      label_override = argv[++i];
+    }
+    else if (argv[i][0] == '-')
     {
       print_help(stderr);
+      free(positional);
       return 2;
     }
+    else
+    {
+      positional[npositional++] = argv[i];
+    }
+  }
+
+  /*
+   * A single positional arg that names a real directory is treated
+   * as PATH. Otherwise (zero args, or more than one, or an arg that
+   * isn't a directory) every positional arg becomes a literal entry
+   * in the list -- this is what makes `wtf $(ls)` work, since a
+   * command substitution expands to a flat list of words, not a path.
+   */
+  const char *path = ".";
+  bool argv_mode = false;
+
+  if (npositional == 1)
+  {
+    struct stat st;
+    if (stat(positional[0], &st) == 0 && S_ISDIR(st.st_mode))
+      path = positional[0];
+    else
+      argv_mode = true;
+  }
+  else if (npositional > 1)
+  {
+    argv_mode = true;
   }
 
   int err = 0;
   char *buf = NULL;
   wtf_entry_t *list = NULL;
+  char *source_label = NULL;
 
   cvector_init(buf, 512, NULL);
   cvector_init(list, 64, NULL);
@@ -840,17 +1563,45 @@ main(int argc, char **argv)
      * No piped input: auto-source a list, just like running
      * `ls | wtf`, but done natively so directories are marked
      * with a trailing '/'. With -r, recursively walk the tree
-     * instead, fzf-style.
+     * instead, fzf-style. With -d, only directories are listed.
+     * Defaults to the current directory, or the given PATH if
+     * one was passed -- unless argv_mode kicked in, in which case
+     * the positional args themselves are the entries.
      */
-    if (recursive)
-      expanddir_recursive(&buf, ".");
+    if (argv_mode)
+    {
+      for (int i = 0; i < npositional; i++)
+      {
+        size_t len = strlen(positional[i]);
+        for (size_t j = 0; j < len; j++)
+          cvector_push_back(buf, positional[i][j]);
+        cvector_push_back(buf, '\n');
+      }
+      source_label = strdup("argv");
+    }
     else
-      expanddir(&buf, ".");
+    {
+      if (recursive)
+        expanddir_recursive(&buf, path, dirs_only);
+      else
+        expanddir(&buf, path, dirs_only);
+      source_label = strdup(path);
+    }
   }
   else
   {
+    source_label = detect_pipe_writer();
     read_to_vec(&buf, 255, stdin);
+    if (!source_label) source_label = strdup("stdin");
   }
+
+  if (label_override)
+  {
+    free(source_label);
+    source_label = strdup(label_override);
+  }
+
+  free(positional);
 
   /*
    * Split entries by newlines.
@@ -887,8 +1638,19 @@ main(int argc, char **argv)
       );
   }
 
-  wtf_entry_t *entry = finder_start(&list);
-  if (entry)
+  wtf_entry_t **selected_out = NULL;
+  cvector_init(selected_out, 8, NULL);
+
+  wtf_entry_t *entry = finder_start(&list, source_label, path, preview_requested, multi_mode, &selected_out);
+
+  if (multi_mode)
+  {
+    for (size_t i = 0; i < cvector_size(selected_out); i++)
+      printf("%.*s\n", (int)selected_out[i]->label_sz, selected_out[i]->label);
+
+    if (cvector_size(selected_out) == 0) err = 1;
+  }
+  else if (entry)
   {
     printf("%.*s\n", (int)entry->label_sz, entry->label);
   }
@@ -897,6 +1659,8 @@ main(int argc, char **argv)
     err = 1;
   }
 
+  cvector_free(selected_out);
+  free(source_label);
   cvector_set_elem_destructor(list, (void (*)(void*))str_rate_free);
   cvector_free(list);
   cvector_free(buf);
